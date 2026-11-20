@@ -2,7 +2,6 @@ package dt
 
 import (
 	"container/list"
-	"fmt"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -101,11 +100,15 @@ type RDTParams struct {
 	TreeCount   int
 	MinLeafSize int
 	MaxDepth    int
+	// Workers limits concurrent tree building; zero keeps one goroutine per
+	// tree. Results do not depend on this value.
+	Workers int
 }
 
 type RandomDecisionTree struct {
 	trees  []*Tree
 	params RDTParams
+	seed   int64
 }
 
 func (self *RandomDecisionTree) SaveModel(path string) {
@@ -116,20 +119,26 @@ func (self *RandomDecisionTree) LoadModel(path string) {
 
 }
 
-func (rdt *RandomDecisionTree) AppendNodeToTree(samples []*core.MapBasedSample, node *TreeNode, queue *list.List, tree *Tree) {
+// AppendNodeToTree grows one node. All random choices are drawn from the
+// node's tree plan, and feature ids are visited in ascending order so that the
+// "random feature" pick cannot depend on Go's randomized map iteration.
+func (rdt *RandomDecisionTree) AppendNodeToTree(samples []*core.MapBasedSample, node *TreeNode, queue *list.List, tree *Tree, plan TreeRandomPlan) {
 	node.prediction = core.NewArrayVector()
 	for _, k := range node.samples {
 		node.prediction.AddValue(samples[k].Label, 1.0)
 	}
 	node.prediction.Scale(1.0 / node.prediction.Sum())
 
-	random_sample := samples[node.samples[rand.Intn(len(node.samples))]]
+	random_sample := samples[node.samples[plan.Rng.Intn(len(node.samples))]]
 
 	split := core.Feature{Id: -1, Value: -1.0}
-	for fid, fvalue := range random_sample.Features {
-		if split.Id < 0 || rand.Intn(len(random_sample.Features)) == 0 {
+	feature_ids := sortedFeatureIds(random_sample.Features)
+	for _, fid := range feature_ids {
+		// Reproduce the original 1/len(features) per-key draw with the
+		// deterministic per-tree RNG over a fixed id ordering.
+		if split.Id < 0 || plan.Rng.Intn(len(feature_ids)) == 0 {
 			split.Id = fid
-			split.Value = fvalue
+			split.Value = random_sample.Features[fid]
 		}
 	}
 
@@ -167,13 +176,15 @@ func (rdt *RandomDecisionTree) AppendNodeToTree(samples []*core.MapBasedSample, 
 	}
 }
 
-func (rdt *RandomDecisionTree) SingleTreeBuild(samples []*core.MapBasedSample) Tree {
+// SingleTreeBuild builds one tree using only the randomness in plan, so the
+// same data plus the same plan always produce the same tree.
+func (rdt *RandomDecisionTree) SingleTreeBuild(samples []*core.MapBasedSample, plan TreeRandomPlan) Tree {
 	tree := Tree{}
 	queue := list.New()
 	root := TreeNode{depth: 0, left: -1, right: -1, prediction: core.NewArrayVector(), samples: []int{}}
 
 	for i := 0; i < len(samples); i++ {
-		k := rand.Intn(len(samples))
+		k := plan.Rng.Intn(len(samples))
 		root.AddSample(k)
 		root.prediction.AddValue(samples[k].Label, 1.0)
 	}
@@ -189,15 +200,17 @@ func (rdt *RandomDecisionTree) SingleTreeBuild(samples []*core.MapBasedSample) T
 		}
 
 		for _, node := range nodes {
-			rdt.AppendNodeToTree(samples, node, queue, &tree)
+			rdt.AppendNodeToTree(samples, node, queue, &tree, plan)
 		}
 	}
 	return tree
 }
 
-func (rdt *RandomDecisionTree) RandomShuffle(features []core.Feature) {
+// RandomShuffle performs a Fisher-Yates shuffle with an explicit RNG, keeping
+// the result reproducible for a given plan instead of sharing global state.
+func (rdt *RandomDecisionTree) RandomShuffle(features []core.Feature, rng *rand.Rand) {
 	for i := range features {
-		j := rand.Intn(i + 1)
+		j := rng.Intn(i + 1)
 		features[i], features[j] = features[j], features[i]
 	}
 }
@@ -209,23 +222,32 @@ func (rdt *RandomDecisionTree) Train(dataset *core.DataSet) {
 	}
 	dataset.Samples = nil
 
-	forest := make(chan *Tree, rdt.params.TreeCount)
+	// Per-tree plans are derived by stable identity before any goroutine runs,
+	// and results are written back at their index, so worker scheduling cannot
+	// change either a tree's draws or its position in the model.
+	plans := BuildTreeRandomPlans(rdt.seed, rdt.params.TreeCount)
+	forest := make([]*Tree, rdt.params.TreeCount)
+
+	workerCount := rdt.params.Workers
+	if workerCount <= 0 {
+		workerCount = rdt.params.TreeCount
+	}
+	semaphore := make(chan struct{}, workerCount)
+
 	var wait sync.WaitGroup
 	wait.Add(rdt.params.TreeCount)
 	for k := 0; k < rdt.params.TreeCount; k++ {
-		go func() {
-			tree := rdt.SingleTreeBuild(samples)
-			forest <- &tree
-			fmt.Printf(".")
-			wait.Done()
-		}()
+		semaphore <- struct{}{}
+		go func(treeID int) {
+			defer wait.Done()
+			defer func() { <-semaphore }()
+			tree := rdt.SingleTreeBuild(samples, plans[treeID])
+			forest[treeID] = &tree
+		}(k)
 	}
 	wait.Wait()
-	fmt.Println()
-	close(forest)
-	for tree := range forest {
-		rdt.trees = append(rdt.trees, tree)
-	}
+	rdt.trees = make([]*Tree, rdt.params.TreeCount)
+	copy(rdt.trees, forest)
 }
 
 func (rdt *RandomDecisionTree) Predict(sample *core.Sample) float64 {
@@ -258,4 +280,6 @@ func (rdt *RandomDecisionTree) Init(params map[string]string) {
 	rdt.params.MinLeafSize, _ = strconv.Atoi(params["min-leaf-size"])
 	rdt.params.TreeCount, _ = strconv.Atoi(params["tree-count"])
 	rdt.params.MaxDepth, _ = strconv.Atoi(params["max-depth"])
+	rdt.params.Workers, _ = strconv.Atoi(params["workers"])
+	rdt.seed = parseRandomSeed(params)
 }

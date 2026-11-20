@@ -2,8 +2,6 @@ package dt
 
 import (
 	"bufio"
-	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +13,11 @@ import (
 type RandomForestParams struct {
 	TreeCount    int
 	FeatureCount float64
+	// Workers limits how many trees are built concurrently. Zero means one
+	// goroutine per tree (the original fully-parallel behavior). The result is
+	// identical for any value because every tree's randomness is fixed by its
+	// index-derived plan; this only throttles concurrency.
+	Workers int
 }
 
 type RandomForest struct {
@@ -22,6 +25,7 @@ type RandomForest struct {
 	params              RandomForestParams
 	cart                CART
 	continuous_features bool
+	seed                int64
 }
 
 func (self *RandomForest) SaveModel(path string) {
@@ -56,7 +60,6 @@ func (self *RandomForest) LoadModel(path string) {
 			text = append(text, line)
 		}
 	}
-	log.Println("rf tree count :", len(self.trees))
 }
 
 func (dt *RandomForest) Init(params map[string]string) {
@@ -66,6 +69,8 @@ func (dt *RandomForest) Init(params map[string]string) {
 	feature_count, _ := strconv.ParseFloat(params["feature-count"], 64)
 	dt.params.TreeCount = int(tree_count)
 	dt.params.FeatureCount = feature_count
+	dt.params.Workers, _ = strconv.Atoi(params["workers"])
+	dt.seed = parseRandomSeed(params)
 }
 
 func (dt *RandomForest) Train(dataset *core.DataSet) {
@@ -88,25 +93,41 @@ func (dt *RandomForest) Train(dataset *core.DataSet) {
 	}
 	dt.cart.continuous_features = dt.continuous_features
 
-	trees := make(chan *Tree, dt.params.TreeCount)
+	// Every tree identity gets its random plan up front, in index order.
+	// Bootstrap draws, row subsampling and candidate feature selection are
+	// therefore fixed per tree and immune to goroutine completion order.
+	plans := BuildTreeRandomPlans(dt.seed, dt.params.TreeCount)
+	trees := make([]*Tree, dt.params.TreeCount)
+
+	// Optional worker cap: a buffered semaphore. With Workers <= 0 every tree
+	// gets its own goroutine, preserving the original parallelism.
+	workerCount := dt.params.Workers
+	if workerCount <= 0 {
+		workerCount = dt.params.TreeCount
+	}
+	semaphore := make(chan struct{}, workerCount)
+
 	var wait sync.WaitGroup
 	wait.Add(dt.params.TreeCount)
-
 	for i := 0; i < dt.params.TreeCount; i++ {
-
-		go func() {
-			tree := dt.cart.SingleTreeBuild(samples, dt.params.FeatureCount, true)
-			trees <- &tree
-			fmt.Printf(".")
-			wait.Done()
-		}()
+		semaphore <- struct{}{}
+		go func(treeID int) {
+			defer wait.Done()
+			defer func() { <-semaphore }()
+			// Each goroutine works on its own CART value and its own plan:
+			// nothing mutable is shared between trees, so another forest
+			// training in parallel cannot perturb this one.
+			cart := dt.cart
+			tree := cart.SingleTreeBuild(samples, dt.params.FeatureCount, true, plans[treeID])
+			trees[treeID] = &tree
+		}(i)
 	}
 	wait.Wait()
-	fmt.Println()
-	close(trees)
-	for tree := range trees {
-		dt.trees = append(dt.trees, tree)
-	}
+
+	// Assemble the model by stable tree identity, not by channel arrival
+	// order, so the forest (and its averaged predictions) is always identical.
+	dt.trees = make([]*Tree, dt.params.TreeCount)
+	copy(dt.trees, trees)
 }
 
 func (dt *RandomForest) Predict(sample *core.Sample) float64 {

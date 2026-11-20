@@ -7,7 +7,6 @@ import (
 	"github.com/xlvector/hector/core"
 	"io/ioutil"
 	"math"
-	"math/rand"
 	"os"
 	"sort"
 	"strconv"
@@ -21,7 +20,7 @@ type CART struct {
 	tree                Tree
 	params              CARTParams
 	continuous_features bool
-	salt                int64
+	seed                int64
 }
 
 func DTGoLeft(sample *core.MapBasedSample, feature_split core.Feature) bool {
@@ -46,38 +45,58 @@ func DTGetElementFromQueue(queue *list.List, n int) []*TreeNode {
 	return ret
 }
 
-func (dt *CART) RandByFeatureId(fid int64) float64 {
-	ret := fid*19857 + dt.salt
+// RandByFeatureId decides whether a feature belongs to the candidate subset of
+// a node. The decision is a pure function of the feature id and the tree's
+// salt, hence identical across runs, worker counts and goroutine orderings.
+func RandByFeatureId(fid int64, salt int64) float64 {
+	ret := fid*19857 + salt
 	r := math.Abs(float64(ret%1000) / 1000.0)
 	return r
 }
 
-func (dt *CART) FindBestSplitOfContinusousFeature(samples []*core.MapBasedSample, node *TreeNode, feature_select_prob float64) {
+// sortedFeatureIds returns the keys of a sample's feature map in ascending
+// order. Iterating candidate features in this fixed order makes the choice
+// between equal-gini candidates deterministic: the feature with the smallest
+// id wins, instead of whichever key the random map iterator produced first.
+func sortedFeatureIds(features map[int64]float64) []int64 {
+	ids := make([]int64, 0, len(features))
+	for fid := range features {
+		ids = append(ids, fid)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (dt *CART) FindBestSplitOfContinusousFeature(samples []*core.MapBasedSample, node *TreeNode, feature_select_prob float64, plan TreeRandomPlan) {
 	feature_weight_labels := make(map[int64]*core.FeatureLabelDistribution)
 	total_dis := core.NewArrayVector()
 	for i, k := range node.samples {
-		if i > 10 && rand.Float64() > dt.params.SamplingRatio {
+		if i > 10 && plan.Rng.Float64() > dt.params.SamplingRatio {
 			continue
 		}
 		total_dis.AddValue(samples[k].Label, 1.0)
-		for fid, fvalue := range samples[k].Features {
-			if dt.RandByFeatureId(fid) > feature_select_prob {
+		for _, fid := range sortedFeatureIds(samples[k].Features) {
+			if RandByFeatureId(fid, plan.Salt) > feature_select_prob {
 				continue
 			}
 			_, ok := feature_weight_labels[fid]
 			if !ok {
 				feature_weight_labels[fid] = core.NewFeatureLabelDistribution()
 			}
-			feature_weight_labels[fid].AddWeightLabel(fvalue, samples[k].Label)
+			feature_weight_labels[fid].AddWeightLabel(samples[k].Features[fid], samples[k].Label)
 		}
 	}
 
 	min_gini := 1.0
 	node.feature_split = core.Feature{Id: -1, Value: 0}
-	for fid, distribution := range feature_weight_labels {
+	// Fixed iteration order plus strict "less than" gives equal-score
+	// candidates a stable resolution: the first (smallest-id) feature reaching
+	// the minimum gini is kept and later ties cannot replace it.
+	for _, fid := range sortedMapKeys(feature_weight_labels) {
+		distribution := feature_weight_labels[fid]
 		sort.Sort(distribution)
 		split, gini := distribution.BestSplitByGini(total_dis)
-		if min_gini > gini {
+		if gini < min_gini {
 			min_gini = gini
 			node.feature_split.Id = fid
 			node.feature_split.Value = split
@@ -89,16 +108,16 @@ func (dt *CART) FindBestSplitOfContinusousFeature(samples []*core.MapBasedSample
 	}
 }
 
-func (dt *CART) FindBestSplitOfBinaryFeature(samples []*core.MapBasedSample, node *TreeNode, feature_select_prob float64) {
+func (dt *CART) FindBestSplitOfBinaryFeature(samples []*core.MapBasedSample, node *TreeNode, feature_select_prob float64, plan TreeRandomPlan) {
 	feature_right_dis := make(map[int64]*core.ArrayVector)
 	total_dis := core.NewArrayVector()
 	for i, k := range node.samples {
-		if i > 10 && rand.Float64() > dt.params.SamplingRatio {
+		if i > 10 && plan.Rng.Float64() > dt.params.SamplingRatio {
 			continue
 		}
 		total_dis.AddValue(samples[k].Label, 1.0)
-		for fid, _ := range samples[k].Features {
-			if dt.RandByFeatureId(fid) > feature_select_prob {
+		for _, fid := range sortedFeatureIds(samples[k].Features) {
+			if RandByFeatureId(fid, plan.Salt) > feature_select_prob {
 				continue
 			}
 			_, ok := feature_right_dis[fid]
@@ -111,11 +130,14 @@ func (dt *CART) FindBestSplitOfBinaryFeature(samples []*core.MapBasedSample, nod
 
 	min_gini := 1.0
 	node.feature_split = core.Feature{Id: -1, Value: 0}
-	for fid, right_dis := range feature_right_dis {
+	// Candidates are visited in ascending feature id order and strict
+	// inequality breaks ties deterministically on the smallest feature id.
+	for _, fid := range sortedMapKeys(feature_right_dis) {
+		right_dis := feature_right_dis[fid]
 		left_dis := total_dis.Copy()
 		left_dis.AddVector(right_dis, -1.0)
 		gini := core.Gini(left_dis, right_dis)
-		if min_gini > gini {
+		if gini < min_gini {
 			min_gini = gini
 			node.feature_split.Id = fid
 			node.feature_split.Value = 1.0
@@ -127,15 +149,15 @@ func (dt *CART) FindBestSplitOfBinaryFeature(samples []*core.MapBasedSample, nod
 	}
 }
 
-func (dt *CART) AppendNodeToTree(samples []*core.MapBasedSample, node *TreeNode, queue *list.List, tree *Tree, feature_select_prob float64) {
+func (dt *CART) AppendNodeToTree(samples []*core.MapBasedSample, node *TreeNode, queue *list.List, tree *Tree, feature_select_prob float64, plan TreeRandomPlan) {
 	if node.depth >= dt.params.MaxDepth {
 		return
 	}
 
 	if dt.continuous_features {
-		dt.FindBestSplitOfContinusousFeature(samples, node, feature_select_prob)
+		dt.FindBestSplitOfContinusousFeature(samples, node, feature_select_prob, plan)
 	} else {
-		dt.FindBestSplitOfBinaryFeature(samples, node, feature_select_prob)
+		dt.FindBestSplitOfBinaryFeature(samples, node, feature_select_prob, plan)
 	}
 	if node.feature_split.Id < 0 {
 		return
@@ -173,7 +195,10 @@ func (dt *CART) AppendNodeToTree(samples []*core.MapBasedSample, node *TreeNode,
 	}
 }
 
-func (dt *CART) SingleTreeBuild(samples []*core.MapBasedSample, feature_select_prob float64, bootstrap bool) Tree {
+// SingleTreeBuild builds one tree. All randomness comes from the supplied
+// plan, never from the package-global rand source, so the same data and plan
+// always yield the same tree regardless of how callers schedule workers.
+func (dt *CART) SingleTreeBuild(samples []*core.MapBasedSample, feature_select_prob float64, bootstrap bool, plan TreeRandomPlan) Tree {
 	tree := Tree{}
 	queue := list.New()
 	root := TreeNode{depth: 0, left: -1, right: -1, prediction: core.NewArrayVector(), samples: []int{}}
@@ -185,7 +210,7 @@ func (dt *CART) SingleTreeBuild(samples []*core.MapBasedSample, feature_select_p
 		}
 	} else {
 		for i := 0; i < len(samples); i++ {
-			k := rand.Intn(len(samples))
+			k := plan.Rng.Intn(len(samples))
 			root.AddSample(k)
 			root.prediction.AddValue(samples[k].Label, 1.0)
 		}
@@ -202,7 +227,7 @@ func (dt *CART) SingleTreeBuild(samples []*core.MapBasedSample, feature_select_p
 		}
 
 		for _, node := range nodes {
-			dt.AppendNodeToTree(samples, node, queue, &tree, feature_select_prob)
+			dt.AppendNodeToTree(samples, node, queue, &tree, feature_select_prob, plan)
 		}
 	}
 	return tree
@@ -255,7 +280,10 @@ func (dt *CART) Train(dataset *core.DataSet) {
 	} else {
 		fmt.Println("Binary DataSet")
 	}
-	dt.tree = dt.SingleTreeBuild(samples, 1.0, false)
+	// A standalone CART owns one deterministic plan derived from its seed,
+	// rather than drawing a salt from the global rand source.
+	plan := NewTreeRandomPlan(dt.seed)
+	dt.tree = dt.SingleTreeBuild(samples, 1.0, false, plan)
 }
 
 func (dt *CART) Predict(sample *core.Sample) float64 {
@@ -301,6 +329,29 @@ func (dt *CART) Init(params map[string]string) {
 	dt.params.MinLeafSize = int(min_leaf_size)
 	dt.params.MaxDepth = int(max_depth)
 	dt.params.GiniThreshold, _ = strconv.ParseFloat(params["gini"], 64)
-	dt.salt = rand.Int63n(10000000000)
 	dt.params.SamplingRatio, _ = strconv.ParseFloat(params["dt-sample-ratio"], 64)
+	dt.seed = parseRandomSeed(params)
+}
+
+// sortedMapKeys returns the keys of a feature-keyed map in ascending order,
+// stabilizing the resolution of equal-score split candidates.
+func sortedMapKeys[V any](m map[int64]V) []int64 {
+	ids := make([]int64, 0, len(m))
+	for fid := range m {
+		ids = append(ids, fid)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// parseRandomSeed reads the optional "seed" parameter. A missing or invalid
+// value falls back to DefaultRandomSeed so training is reproducible out of the
+// box while still allowing callers to request different draws explicitly.
+func parseRandomSeed(params map[string]string) int64 {
+	if raw, ok := params["seed"]; ok {
+		if seed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			return seed
+		}
+	}
+	return DefaultRandomSeed
 }
