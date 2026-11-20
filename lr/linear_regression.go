@@ -44,6 +44,8 @@ func (algo *LinearRegression) Init(params map[string]string) {
 
 	algo.Params.LearningRate, _ = strconv.ParseFloat(params["learning-rate"], 64)
 	algo.Params.Regularization, _ = strconv.ParseFloat(params["regularization"], 64)
+	steps, _ := strconv.ParseInt(params["steps"], 10, 32)
+	algo.Params.Steps = int(steps)
 }
 
 func (algo *LinearRegression) Train(dataset *core.DataSet) {

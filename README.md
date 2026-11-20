@@ -59,6 +59,46 @@ Then, you can use model file to test any test dataset:
 
 	./hector-run --method [Method] --action test --test [Data Path] --model [Model Path]
 
+# Stacked Generalization (out-of-fold stacking)
+
+The `stack` package trains a two-layer stacking ensemble the correct way:
+
+1. Each base model is trained K times on K-1 folds and predicts **only the
+   fold it was not trained on**. These out-of-fold (OOF) predictions are the
+   only data the second layer ever sees, so no training sample leaks through
+   its own base model.
+2. OOF predictions are joined by **stable sample id** (never by slice
+   position) and laid out in a **fixed base-model order** that is stored with
+   the model. Missing, duplicated, mis-folded, mis-labeled or non-finite OOF
+   predictions are rejected before the meta model is trained.
+3. The meta model (`lr.LinearRegression`) is trained on those OOF features.
+4. At application time every base model is **re-fitted on the complete
+   training set**; the same meta model then combines their predictions. The
+   whole inference chain (manifest + base models + meta model) is saved into
+   one model directory and reloaded as a unit.
+
+Train the chain (base methods and their column order are given by
+`--stack-methods`):
+
+	go install github.com/xlvector/hector/hectorstack
+	hector-stack --action train --train train.tsv --model model_dir \
+	  --stack-methods ftrl,fm,lr --stack-folds 5
+
+Independent test - this loads the saved chain and actually runs it:
+
+	hector-stack --action test --test test.tsv --model model_dir --pred out.txt
+
+Serve the same chain over HTTP (each request runs every base model and the
+meta model in the stored order):
+
+	go install github.com/xlvector/hector/hectorstackserver
+	hector-stack-server --model model_dir --port 8080
+	curl -XPOST localhost:8080/predict -d 'features={"age":0.7,"income":0.1}'
+
+The same entry points are callable from Go through `hector.StackTrain`,
+`hector.StackTest`, `stack.TrainStacking` and `stack.Load`.
+
+
 # Benchmark
 
 ## Binary Classification

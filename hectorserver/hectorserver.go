@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"github.com/xlvector/hector"
 	"github.com/xlvector/hector/algo"
 	"github.com/xlvector/hector/core"
@@ -48,7 +47,12 @@ func (c *ClassifierHandler) ServeHTTP(w http.ResponseWriter,
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprint(w, output)
+	// Write, not fmt.Fprint: Fprint renders a []byte as [123 34 ...] instead
+	// of emitting the JSON bytes.
+	if _, err := w.Write(output); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 func main() {
