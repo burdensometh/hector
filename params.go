@@ -121,6 +121,8 @@ func PrepareParams() (string, string, string, string, map[string]string) {
 	hidden := flag.Int64("hidden", 1, "hidden neuron number")
 	profile := flag.String("profile", "", "profile file name")
 	model := flag.String("model", "", "model file name")
+	checkpoint := flag.String("checkpoint", "", "checkpoint file for resumable batched training (ftrl only)")
+	batchSize := flag.Int("batch-size", 1000, "samples per confirmed checkpoint batch (ftrl only)")
 	action := flag.String("action", "", "train or test, do both if action is empty string")
 	core := flag.Int("core", 1, "core number when run program")
 	dt_sample_ratio := flag.String("dt-sample-ratio", "1.0", "sampling ratio when split feature in decision tree")
@@ -160,6 +162,8 @@ func PrepareParams() (string, string, string, string, map[string]string) {
 	params["profile"] = *profile
 	params["action"] = *action
 	params["model"] = *model
+	params["checkpoint"] = *checkpoint
+	params["batch-size"] = strconv.FormatInt(int64(*batchSize), 10)
 	params["method"] = *method
 	params["dt-sample-ratio"] = *dt_sample_ratio
 	params["dim"] = *dim

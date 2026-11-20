@@ -12,6 +12,7 @@ import (
 	"github.com/xlvector/hector/algo"
 	"github.com/xlvector/hector/core"
 	"github.com/xlvector/hector/eval"
+	"github.com/xlvector/hector/lr"
 	"os"
 	"strconv"
 )
@@ -51,12 +52,40 @@ func AlgorithmTrain(classifier algo.Classifier, train_path string,
 		return err
 	}
 
-	classifier.Init(params)
-	classifier.Train(train_dataset)
+	// FTRL supports durable, resumable batched training. When a checkpoint
+	// path is configured, the input file content is fingerprinted first and
+	// the checkpoint binds optimizer state, hyper-parameters, epoch and the
+	// next source record position to that fingerprint and to the training
+	// definition. A checkpoint whose input or definition no longer matches
+	// is rejected rather than silently resumed.
+	checkpointPath, _ := params["checkpoint"]
+	if ftrl, ok := classifier.(*lr.FTRLLogisticRegression); ok && checkpointPath != "" {
+		inputFingerprint, err := lr.FingerprintFile(train_path)
+		if err != nil {
+			return err
+		}
+		batchSize, _ := strconv.Atoi(params["batch-size"])
+		if batchSize <= 0 {
+			batchSize = 1000
+		}
+		// ResumeOrTrainBatched initializes a fresh model or restores the
+		// validated checkpoint itself; Init must not run first and wipe the
+		// restored state.
+		if err := ftrl.ResumeOrTrainBatched(train_dataset, params,
+			batchSize, checkpointPath, inputFingerprint); err != nil {
+			return err
+		}
+	} else {
+		classifier.Init(params)
+		classifier.Train(train_dataset)
+	}
 
 	model_path, _ := params["model"]
 
 	if model_path != "" {
+		// The exported model contains prediction weights only. It can be
+		// loaded back for inference but it is NOT sufficient to resume the
+		// optimization process; that requires the checkpoint.
 		classifier.SaveModel(model_path)
 	}
 
