@@ -88,8 +88,38 @@ func (algo *FTRLLogisticRegression) Clear() {
 }
 
 func (algo *FTRLLogisticRegression) Train(dataset *core.DataSet) {
+	if err := algo.TrainWithError(dataset); err != nil {
+		panic(err)
+	}
+}
+
+// TrainWithError trains the model and reports invalid sample weights instead of
+// learning from them.
+//
+// Weight convention: a row with representative weight w enters the data-loss
+// gradient with g_i scaled by w (the (sub)gradient of w * logloss). The FTRL
+// proximal regularizer (lambda1 / lambda2) is a model prior, not part of the
+// data loss, so it is declared to stay per-coordinate and unscaled by w - a
+// single row therefore receives the same shrinkage regardless of its
+// representative weight. A row with weight zero is skipped entirely and is
+// never copied into extra rows. Without sample weights the original update is
+// performed unchanged.
+func (algo *FTRLLogisticRegression) TrainWithError(dataset *core.DataSet) error {
+	weights, weight_source, err := dataset.ResolveWeights()
+	if err != nil {
+		return err
+	}
+
 	for step := 0; step < algo.Params.Steps; step++ {
-		for _, sample := range dataset.Samples {
+		for i, sample := range dataset.Samples {
+			if weight_source != core.WeightSourceNone && weights[i] == 0 {
+				// Zero-weight rows do not participate in learning.
+				continue
+			}
+			scale := 1.0
+			if weight_source != core.WeightSourceNone {
+				scale = weights[i]
+			}
 			prediction := algo.Predict(sample)
 			err := sample.LabelDoubleValue() - prediction
 			for _, feature := range sample.Features {
@@ -99,7 +129,7 @@ func (algo *FTRLLogisticRegression) Train(dataset *core.DataSet) {
 				}
 				zi := model_feature_value.zi
 				ni := model_feature_value.ni
-				gi := -1 * err * feature.Value
+				gi := -1 * scale * err * feature.Value
 				sigma := (math.Sqrt(ni+gi*gi) - math.Sqrt(ni)) / algo.Params.Alpha
 				wi := model_feature_value.Wi(algo.Params)
 				zi += gi - sigma*wi
@@ -108,4 +138,5 @@ func (algo *FTRLLogisticRegression) Train(dataset *core.DataSet) {
 			}
 		}
 	}
+	return nil
 }

@@ -7,11 +7,23 @@ import (
 /*
 Sample - for classification
 Here, label should be int value started from 0
+
+Weight is the optional representative weight of this row. Prefer supplying
+weights through DataSet.Weights (or DataSet.SetWeights / LoadWeights), which
+validates the length and rejects an all-zero vector. Sample.Weight is a
+convenience for callers that build datasets by hand: a dataset counts as
+weighted when it carries a DataSet.Weights slice or when at least one sample
+has a non-zero Weight. Because NewSample leaves Weight at 0, an all-zero
+per-sample vector is indistinguishable from "no weights" and is silently
+treated as unweighted; use DataSet.SetWeights when you need all-zero input to
+be rejected. A zero weight row is excluded from learning and from weighted
+metrics.
 */
 type Sample struct {
 	Features   []Feature
 	Label      int
 	Prediction float64
+	Weight     float64
 }
 
 func NewSample() *Sample {
@@ -19,6 +31,7 @@ func NewSample() *Sample {
 	ret.Features = []Feature{}
 	ret.Label = 0
 	ret.Prediction = 0.0
+	ret.Weight = 0.0
 	return &ret
 }
 
@@ -26,6 +39,7 @@ func (s *Sample) Clone() *Sample {
 	ret := NewSample()
 	ret.Label = s.Label
 	ret.Prediction = s.Prediction
+	ret.Weight = s.Weight
 	for _, feature := range s.Features {
 		clone_feature := Feature{feature.Id, feature.Value}
 		ret.Features = append(ret.Features, clone_feature)

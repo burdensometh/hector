@@ -126,6 +126,9 @@ func PrepareParams() (string, string, string, string, map[string]string) {
 	dt_sample_ratio := flag.String("dt-sample-ratio", "1.0", "sampling ratio when split feature in decision tree")
 	dim := flag.String("dim", "1", "input space dimension")
 	port := flag.String("port", "8080", "port")
+	weights := flag.String("weights", "", "path of training sample weights, one weight per training row")
+	test_weights := flag.String("test-weights", "", "path of test sample weights, one weight per test row")
+	weight_report := flag.String("weight-report", "", "path of the JSON weight provenance report")
 
 	flag.Parse()
 	runtime.GOMAXPROCS(*core)
@@ -163,6 +166,9 @@ func PrepareParams() (string, string, string, string, map[string]string) {
 	params["method"] = *method
 	params["dt-sample-ratio"] = *dt_sample_ratio
 	params["dim"] = *dim
+	params["weights"] = *weights
+	params["test-weights"] = *test_weights
+	params["weight-report"] = *weight_report
 
 	fmt.Println(params)
 	return *train_path, *test_path, *pred_path, *method, params

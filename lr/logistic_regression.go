@@ -56,22 +56,55 @@ func (algo *LogisticRegression) Init(params map[string]string) {
 }
 
 func (algo *LogisticRegression) Train(dataset *core.DataSet) {
+	if err := algo.TrainWithError(dataset); err != nil {
+		panic(err)
+	}
+}
+
+// TrainWithError trains the model and reports invalid sample weights instead of
+// learning from them.
+//
+// Weight convention: the data-loss gradient of row i is scaled by its
+// representative weight w_i, so the model minimizes
+//
+//	sum_i w_i * logloss(x_i, y_i) + (regularization / 2) * ||w||^2
+//
+// over the weighted population. The L2 shrinkage stays in the per-update form
+// of the legacy trainer and is *not* scaled by the sample weight. A row with
+// weight zero is skipped entirely: it contributes neither data loss nor
+// shrinkage and is never copied into extra rows. When no weights are supplied
+// the legacy loop below runs unchanged.
+func (algo *LogisticRegression) TrainWithError(dataset *core.DataSet) error {
+	weights, weight_source, err := dataset.ResolveWeights()
+	if err != nil {
+		return err
+	}
+
 	algo.Model = make(map[int64]float64)
 	for step := 0; step < algo.Params.Steps; step++ {
-		for _, sample := range dataset.Samples {
+		for i, sample := range dataset.Samples {
+			if weight_source != core.WeightSourceNone && weights[i] == 0 {
+				// Zero-weight rows do not participate in learning.
+				continue
+			}
 			prediction := algo.Predict(sample)
 			err := sample.LabelDoubleValue() - prediction
+			scale := 1.0
+			if weight_source != core.WeightSourceNone {
+				scale = weights[i]
+			}
 			for _, feature := range sample.Features {
 				model_feature_value, ok := algo.Model[feature.Id]
 				if !ok {
 					model_feature_value = 0.0
 				}
-				model_feature_value += algo.Params.LearningRate * (err*feature.Value - algo.Params.Regularization*model_feature_value)
+				model_feature_value += algo.Params.LearningRate * (scale*err*feature.Value - algo.Params.Regularization*model_feature_value)
 				algo.Model[feature.Id] = model_feature_value
 			}
 		}
 		algo.Params.LearningRate *= 0.9
 	}
+	return nil
 }
 
 func (algo *LogisticRegression) Predict(sample *core.Sample) float64 {

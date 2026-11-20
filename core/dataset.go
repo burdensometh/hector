@@ -199,7 +199,10 @@ func (d *StreamingDataSet) Load(path string, global_bias_feature_id int64) error
 type DataSet struct {
 	Samples          []*Sample
 	FeatureNameIdMap map[int64]string
-	max_label        int
+	// Weights holds one representative weight per row of Samples. It stays nil
+	// when the caller supplied no weights. See core/weights.go.
+	Weights   []float64
+	max_label int
 }
 
 func NewDataSet() *DataSet {
@@ -211,6 +214,11 @@ func NewDataSet() *DataSet {
 
 func (d *DataSet) AddSample(sample *Sample) {
 	d.Samples = append(d.Samples, sample)
+	if d.Weights != nil {
+		// Keep the weight vector aligned with Samples. A sample added after
+		// weights were attached has the neutral weight 1.
+		d.Weights = append(d.Weights, 1.0)
+	}
 	if d.max_label < sample.Label {
 		d.max_label = sample.Label
 	}
@@ -306,7 +314,13 @@ func (d *DataSet) Split(f func(int) bool) *DataSet {
 	out_data := NewDataSet()
 	for i, sample := range d.Samples {
 		if f(i) {
-			out_data.AddSample(sample)
+			out_data.Samples = append(out_data.Samples, sample)
+			if d.max_label < sample.Label {
+				out_data.max_label = sample.Label
+			}
+			if d.Weights != nil {
+				out_data.Weights = append(out_data.Weights, d.Weights[i])
+			}
 		}
 	}
 	return out_data

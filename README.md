@@ -59,6 +59,43 @@ Then, you can use model file to test any test dataset:
 
 	./hector-run --method [Method] --action test --test [Data Path] --model [Model Path]
 
+# Sample Weights
+
+Sampled training records can carry different representative weights. Weights
+enter the data-loss gradient, not just the final report:
+
+	./hector-run --method lr --train train.tsv --test test.tsv \
+		--weights train.weights --test-weights test.weights \
+		--weight-report weights.json
+
+* `--weights` is one non-negative, finite weight per training row, in row
+  order. Lines are `w`, `row_id<TAB>w` or `row_id:w`; blank lines and `#`
+  comments are ignored. `--test-weights` does the same for the evaluation rows.
+* `--weight-report` writes a JSON record naming the weight files, the weight
+  source, the weighted population and the metric definitions for the run.
+
+Conventions (also embedded in the report):
+
+* A row with weight `w` counts for `w` units of population, but rows are never
+  copied, resampled or reordered. Its data-loss gradient is multiplied by `w`.
+* Regularization is a model prior, not part of the data loss, so the L2 term
+  (LR) and the FTRL proximal terms (`lambda1`/`lambda2`) are **not** scaled by
+  sample weight. A zero-weight row receives no update at all, including no
+  shrinkage.
+* Rows with weight zero are excluded from learning and from the weighted
+  metrics; they are still predicted so the output file stays aligned with the
+  input.
+* Training and evaluation must use the same population: either supply weights
+  for both train and test, or for neither. Supplying only one side fails.
+* An all-zero weight vector, a length mismatch, a negative weight or a
+  non-finite weight fails **before** training starts.
+* Without weights the legacy unweighted path runs unchanged.
+
+`LogisticRegression` and `FTRL` implement the weighted path. Evaluation adds
+`WeightedLogLoss` (`sum(w*logloss)/sum(w)`) and `WeightedAUC` (the area under
+the ROC curve over weighted positive/negative pairs, ties counted one half),
+alongside the unweighted metrics.
+
 # Benchmark
 
 ## Binary Classification

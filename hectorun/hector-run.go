@@ -15,15 +15,38 @@ func main() {
 	classifier := hector.GetClassifier(method)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	if action == "" {
-		auc, _, _ := hector.AlgorithmRun(classifier, train, test, pred, params)
+		auc, report, _, err := hector.AlgorithmRunWithReport(classifier, train, test, pred, params)
+		if err != nil {
+			panic(err)
+		}
 		fmt.Println("AUC:")
 		fmt.Println(auc)
+		printWeightedMetrics(report)
 	} else if action == "train" {
-		hector.AlgorithmTrain(classifier, train, params)
+		if err := hector.AlgorithmTrain(classifier, train, params); err != nil {
+			panic(err)
+		}
 
 	} else if action == "test" {
-		auc, _, _ := hector.AlgorithmTest(classifier, test, pred, params)
+		auc, report, _, err := hector.AlgorithmTestWithReport(classifier, test, pred, params)
+		if err != nil {
+			panic(err)
+		}
 		fmt.Println("AUC:")
 		fmt.Println(auc)
+		printWeightedMetrics(report)
 	}
+}
+
+// printWeightedMetrics reports the weighted metrics next to the legacy AUC so
+// the numbers in the final table are on the same representative population the
+// model was trained on.
+func printWeightedMetrics(report *hector.WeightReport) {
+	if report == nil {
+		return
+	}
+	fmt.Printf("LogLoss: %v\n", report.Metrics.LogLoss)
+	fmt.Printf("WeightedAUC: %v\n", report.Metrics.WeightedAUC)
+	fmt.Printf("WeightedLogLoss: %v\n", report.Metrics.WeightedLogLoss)
+	fmt.Printf("WeightedPopulation: %v\n", report.Metrics.WeightedPopulation)
 }
